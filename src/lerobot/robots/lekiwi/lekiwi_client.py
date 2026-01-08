@@ -17,6 +17,7 @@
 import base64
 import json
 import logging
+import threading
 from functools import cached_property
 from typing import Any
 
@@ -33,6 +34,12 @@ from .config_lekiwi import LeKiwiClientConfig
 class LeKiwiClient(Robot):
     config_class = LeKiwiClientConfig
     name = "lekiwi_client"
+    # Deadzone thresholds used to filter small cmd_vel inputs below these values.
+    LINEAR_VELOCITY_THRESHOLD = 0.1
+    ANGULAR_VELOCITY_THRESHOLD = 0.1
+    # Timeout used when waiting for the ROS 2 spin thread to exit during disconnect.
+    SPIN_THREAD_JOIN_TIMEOUT = 5.0
+    _RCLPY_INIT_LOCK = threading.Lock()
 
     def __init__(self, config: LeKiwiClientConfig):
         import zmq
@@ -71,6 +78,7 @@ class LeKiwiClient(Robot):
         self.node = None
         self.spin_thread = None
         self.twist = None
+        self._twist_lock = threading.Lock()
 
         self._is_connected = False
         self.logs = {}
@@ -116,8 +124,15 @@ class LeKiwiClient(Robot):
     def is_calibrated(self) -> bool:
         pass
 
-    def listener_callback(self, twist):
-        self.twist = twist
+    def _cmd_vel_callback(self, twist):
+        with self._twist_lock:
+            self.twist = twist
+
+    def _pop_twist(self):
+        with self._twist_lock:
+            twist = self.twist
+            self.twist = None
+        return twist
 
     def connect(self) -> None:
         """Establishes ZMQ sockets with the remote mobile robot"""
@@ -146,18 +161,34 @@ class LeKiwiClient(Robot):
             raise DeviceNotConnectedError("Timeout waiting for LeKiwi Host to connect expired.")
 
         import rclpy
-        from rclpy.node import Node
         from geometry_msgs.msg import Twist
-        import threading
-        from functools import partial
+        from rclpy.node import Node
+        from rclpy.utilities import is_initialized
 
-        rclpy.init()
-        self.node = Node("cmd_vel_subscriber")
-        self.node.create_subscription(
-            Twist, "cmd_vel", partial(self.listener_callback), 10
-        )
-        self.spin_thread = threading.Thread(target=rclpy.spin, args=(self.node,), daemon=True)
-        self.spin_thread.start()
+        try:
+            with self._RCLPY_INIT_LOCK:
+                if not is_initialized():
+                    rclpy.init()
+            self.node = Node("cmd_vel_subscriber")
+            self.node.create_subscription(Twist, "cmd_vel", self._cmd_vel_callback, 10)
+            self.spin_thread = threading.Thread(target=rclpy.spin, args=(self.node,), daemon=True)
+            self.spin_thread.start()
+        except Exception as exc:
+            logging.error(f"Failed to initialize ROS 2 node in LeKiwiClient.connect: {exc}")
+            try:
+                self.zmq_cmd_socket.close()
+            except Exception as cleanup_exc:
+                logging.warning("Failed to close ZMQ cmd socket after ROS 2 init error: %s", cleanup_exc)
+            try:
+                self.zmq_observation_socket.close()
+            except Exception as cleanup_exc:
+                logging.warning("Failed to close ZMQ observation socket after ROS 2 init error: %s", cleanup_exc)
+            try:
+                self.zmq_context.term()
+            except Exception as cleanup_exc:
+                logging.warning("Failed to terminate ZMQ context after ROS 2 init error: %s", cleanup_exc)
+            self._is_connected = False
+            raise DeviceNotConnectedError(f"Failed to initialize ROS 2 for LeKiwiClient: {exc}") from exc
 
         self._is_connected = True
 
@@ -325,32 +356,41 @@ class LeKiwiClient(Robot):
             "theta.vel": theta_cmd,
         }
 
-    def _from_twist_to_base_action(self):
-        if self.twist:
-            speed_setting = self.speed_levels[self.speed_index]
-            xy_speed = speed_setting["xy"]  # e.g. 0.1, 0.25, or 0.4
-            theta_speed = speed_setting["theta"]  # e.g. 30, 60, or 90
+    def from_twist_to_base_action(self):
+        """
+        Convert the latest twist command into a base action dictionary.
 
-            x_cmd = 0.0  # m/s forward/backward
-            y_cmd = 0.0  # m/s lateral
-            theta_cmd = 0.0  # deg/s rotation
-
-            if self.twist.linear.x > 0.1:
-                x_cmd += xy_speed
-            elif self.twist.linear.x < -0.1:
-                x_cmd -= xy_speed
-            if self.twist.angular.z > 0.1:
-                theta_cmd += theta_speed
-            elif self.twist.angular.z < -0.1:
-                theta_cmd -= theta_speed
-            self.twist = None
-            return {
-                "x.vel": x_cmd,
-                "y.vel": y_cmd,
-                "theta.vel": theta_cmd,
-            }
-        else:
+        The method reads and then clears ``self.twist`` under a lock, applies the deadzone thresholds
+        (``LINEAR_VELOCITY_THRESHOLD`` and ``ANGULAR_VELOCITY_THRESHOLD``), and maps the values to
+        ``"x.vel"``, ``"y.vel"``, and ``"theta.vel"`` based on the current ``speed_levels`` entry.
+        Returns ``None`` when no twist message has been received.
+        """
+        twist = self._pop_twist()
+        if twist is None:
             return None
+
+        speed_setting = self.speed_levels[self.speed_index]
+        xy_speed = speed_setting["xy"]
+        theta_speed = speed_setting["theta"]
+
+        x_cmd = 0.0  # m/s forward/backward
+        y_cmd = 0.0  # m/s lateral
+        theta_cmd = 0.0  # deg/s rotation
+
+        if twist.linear.x > self.LINEAR_VELOCITY_THRESHOLD:
+            x_cmd += xy_speed
+        elif twist.linear.x < -self.LINEAR_VELOCITY_THRESHOLD:
+            x_cmd -= xy_speed
+        if twist.angular.z > self.ANGULAR_VELOCITY_THRESHOLD:
+            theta_cmd += theta_speed
+        elif twist.angular.z < -self.ANGULAR_VELOCITY_THRESHOLD:
+            theta_cmd -= theta_speed
+
+        return {
+            "x.vel": x_cmd,
+            "y.vel": y_cmd,
+            "theta.vel": theta_cmd,
+        }
 
     def configure(self):
         pass
@@ -388,13 +428,48 @@ class LeKiwiClient(Robot):
             raise DeviceNotConnectedError(
                 "LeKiwi is not connected. You need to run `robot.connect()` before disconnecting."
             )
-        self.zmq_observation_socket.close()
-        self.zmq_cmd_socket.close()
-        self.zmq_context.term()
-        if self.node:
-            import rclpy
-            self.node.destroy_node()
-            rclpy.shutdown()
-        if self.spin_thread:
-            self.spin_thread.join()
+        try:
+            self.zmq_observation_socket.close()
+        except Exception as exc:
+            logging.warning("Failed to close ZMQ observation socket during disconnect: %s", exc)
+        try:
+            self.zmq_cmd_socket.close()
+        except Exception as exc:
+            logging.warning("Failed to close ZMQ command socket during disconnect: %s", exc)
+        try:
+            self.zmq_context.term()
+        except Exception as exc:
+            logging.warning("Failed to terminate ZMQ context during disconnect: %s", exc)
+
+        if self.node is not None:
+            try:
+                import rclpy
+            except Exception as exc:
+                logging.warning("Failed to import rclpy during disconnect: %s", exc)
+            else:
+                try:
+                    self.node.destroy_node()
+                except Exception as exc:
+                    logging.warning("Failed to destroy ROS 2 node during disconnect: %s", exc)
+                try:
+                    if rclpy.ok():
+                        rclpy.shutdown()
+                except Exception as exc:
+                    logging.warning("Failed to shut down rclpy during disconnect: %s", exc)
+
+        if self.spin_thread is not None:
+            try:
+                if self.spin_thread.is_alive():
+                    self.spin_thread.join(timeout=self.SPIN_THREAD_JOIN_TIMEOUT)
+                    if self.spin_thread.is_alive():
+                        logging.warning(
+                            "Spin thread did not terminate within %.1fs during disconnect; continuing shutdown "
+                            "(daemon thread will exit with process).",
+                            self.SPIN_THREAD_JOIN_TIMEOUT,
+                        )
+            except Exception as exc:
+                logging.warning("Failed to join ROS 2 spin thread during disconnect: %s", exc)
+
+        self.node = None
+        self.spin_thread = None
         self._is_connected = False
